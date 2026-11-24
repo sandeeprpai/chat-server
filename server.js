@@ -148,10 +148,25 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 function registerClient(userId, ws) {
-  if (!clients.has(userId)) {
-    clients.set(userId, new Set());
+  let set = clients.get(userId);
+
+  // One user id should have exactly one live socket. If an older socket is still
+  // registered (stale app process or an old APK), close it so messages always go
+  // to the newest connection.
+  if (set && set.size > 0) {
+    for (const old of set) {
+      if (old !== ws && old.readyState === old.OPEN) {
+        log("superseded_socket", { userId });
+        old.close(4000, "Superseded by newer connection");
+      }
+    }
+    set.clear();
+  } else {
+    set = new Set();
+    clients.set(userId, set);
   }
-  clients.get(userId).add(ws);
+
+  set.add(ws);
 }
 
 function unregisterClient(userId, ws) {
@@ -194,6 +209,20 @@ function deliverOrQueue(toId, rawPayload) {
 function flushPending(userId, ws) {
   const queue = pendingQueue.get(userId);
   if (!queue || queue.length === 0) return;
+
+  // Stale signals from an earlier session can arrive after a reinstall/reconnect and
+  // cancel a brand-new friend request. Log what was flushed so this is diagnosable.
+  log("flushed_pending", {
+    userId,
+    count: queue.length,
+    types: queue.slice(0, 20).map((raw) => {
+      try {
+        return JSON.parse(raw).type || "chat";
+      } catch (_) {
+        return "invalid";
+      }
+    })
+  });
 
   while (queue.length > 0 && ws.readyState === ws.OPEN) {
     const item = queue.shift();
