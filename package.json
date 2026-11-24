@@ -1,0 +1,15 @@
+{
+  "name": "sancil-chat-server",
+  "version": "1.0.0",
+  "description": "Lightweight ephemeral WebSocket chat & WebRTC signaling relay for Android",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
