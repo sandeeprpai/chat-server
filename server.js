@@ -2,6 +2,8 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
+// Bump this when deploying so /health confirms which server version Render is running.
+const RELAY_VERSION = 3;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -9,6 +11,8 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 // In-memory maps only (zero database, zero disk storage)
 const clients = new Map();       // userId -> Set<WebSocket>
 const pendingQueue = new Map();  // recipientId -> Array<JSON string>
+const blockEvents = [];          // recent relay-observed block/unblock signals
+const MAX_BLOCK_EVENTS = 500;
 
 function nowIso(ms) {
   return new Date(ms).toISOString();
@@ -36,7 +40,66 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body, null, 2));
 }
 
-const server = http.createServer((req, res) => {
+function isValidUserId(id) {
+  return typeof id === "string" && /^[a-z0-9_]{3,24}$/.test(id.trim().toLowerCase());
+}
+
+function recordBlockEvent(action, blocker, blocked, source) {
+  blockEvents.push({
+    at: Date.now(),
+    action,
+    blocker,
+    blocked,
+    source
+  });
+  if (blockEvents.length > MAX_BLOCK_EVENTS) {
+    blockEvents.shift();
+  }
+}
+
+function currentBlockState() {
+  // Last event wins for each blocker/blocked pair.
+  const latest = new Map();
+  for (const event of blockEvents) {
+    latest.set(`${event.blocker}|${event.blocked}`, event);
+  }
+  const active = [];
+  for (const event of latest.values()) {
+    if (event.action === "blocked") {
+      active.push({
+        blocker: event.blocker,
+        blocked: event.blocked,
+        since: nowIso(event.at),
+        source: event.source
+      });
+    }
+  }
+  active.sort((a, b) => a.blocker.localeCompare(b.blocker) || a.blocked.localeCompare(b.blocked));
+  return active;
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk;
+      if (raw.length > 4096) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      try {
+        resolve(raw.length ? JSON.parse(raw) : {});
+      } catch (_) {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
   let url;
   try {
     url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -48,7 +111,12 @@ const server = http.createServer((req, res) => {
 
   // Simple HTTP health check endpoint for Render / uptime checks
   if (url.pathname === "/" || url.pathname === "/health") {
-    sendJson(res, 200, { ok: true, service: "sancil-chat-relay" });
+    sendJson(res, 200, {
+      ok: true,
+      service: "sancil-chat-relay",
+      version: RELAY_VERSION,
+      features: ["admin_clients", "admin_blocks", "admin_unblock", "signal_logs", "flush_logs", "socket_dedupe"]
+    });
     return;
   }
 
@@ -111,6 +179,106 @@ const server = http.createServer((req, res) => {
         messages: queuedMessages,
         details: queueDetails
       }
+    });
+    return;
+  }
+
+  // Owner-only view of block signals the relay has observed since the last restart.
+  if (url.pathname === "/admin/blocks") {
+    if (req.method !== "GET") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!ADMIN_TOKEN) {
+      sendJson(res, 503, { ok: false, error: "ADMIN_TOKEN is not configured" });
+      return;
+    }
+    if (!isAdminAuthorized(req)) {
+      sendJson(res, 401, { ok: false, error: "Unauthorized" });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      generatedAt: nowIso(Date.now()),
+      note: "Relay-observed only; blocks made while offline are not visible until relayed.",
+      currentBlocks: currentBlockState(),
+      events: blockEvents.slice().reverse().map((event) => ({
+        at: nowIso(event.at),
+        action: event.action,
+        blocker: event.blocker,
+        blocked: event.blocked,
+        source: event.source
+      }))
+    });
+    return;
+  }
+
+  // Owner override. Sends an admin_unblock signal to both ids so both local databases
+  // clear their block flags for each other. Works immediately if both are connected;
+  // otherwise the signal is queued in RAM until they reconnect.
+  if (url.pathname === "/admin/unblock") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!ADMIN_TOKEN) {
+      sendJson(res, 503, { ok: false, error: "ADMIN_TOKEN is not configured" });
+      return;
+    }
+    if (!isAdminAuthorized(req)) {
+      sendJson(res, 401, { ok: false, error: "Unauthorized" });
+      return;
+    }
+
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    if (!userId || !peerId || userId === peerId) {
+      sendJson(res, 400, {
+        ok: false,
+        error: "Provide two different valid userId values (3-24 lowercase letters, numbers or underscore)"
+      });
+      return;
+    }
+
+    const sendTo = [
+      { targetId: userId, otherId: peerId },
+      { targetId: peerId, otherId: userId }
+    ];
+    const sentTo = [];
+    for (const item of sendTo) {
+      const raw = JSON.stringify({
+        type: "admin_unblock",
+        from: "admin",
+        to: item.targetId,
+        peerId: item.otherId,
+        timestamp: Date.now()
+      });
+      const delivered = deliverOrQueue(item.targetId, raw);
+      log("admin_unblock_sent", {
+        targetId: item.targetId,
+        peerId: item.otherId,
+        delivered,
+        queued: !delivered
+      });
+      sentTo.push({ userId: item.targetId, peerId: item.otherId, delivered, queued: !delivered });
+    }
+
+    recordBlockEvent("unblocked_by_admin", peerId, userId, "admin");
+    recordBlockEvent("unblocked_by_admin", userId, peerId, "admin");
+
+    sendJson(res, 200, {
+      ok: true,
+      message: "Unblock signal sent to both users",
+      sentTo
     });
     return;
   }
@@ -271,6 +439,15 @@ wss.on("connection", (ws) => {
     payload.from = userId;
     if (!payload.timestamp) {
       payload.timestamp = Date.now();
+    }
+
+    if (type === "blocked_by_peer" || type === "unblocked_by_peer") {
+      recordBlockEvent(
+        type === "blocked_by_peer" ? "blocked" : "unblocked",
+        userId,
+        toId,
+        "signal"
+      );
     }
 
     const delivered = deliverOrQueue(toId, JSON.stringify(payload));
