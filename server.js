@@ -3,7 +3,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 3;
+const RELAY_VERSION = 4;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -12,7 +12,9 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const clients = new Map();       // userId -> Set<WebSocket>
 const pendingQueue = new Map();  // recipientId -> Array<JSON string>
 const blockEvents = [];          // recent relay-observed block/unblock signals
+const signalEvents = [];         // recent non-chat signals, for owner diagnostics
 const MAX_BLOCK_EVENTS = 500;
+const MAX_SIGNAL_EVENTS = 500;
 
 function nowIso(ms) {
   return new Date(ms).toISOString();
@@ -54,6 +56,13 @@ function recordBlockEvent(action, blocker, blocked, source) {
   });
   if (blockEvents.length > MAX_BLOCK_EVENTS) {
     blockEvents.shift();
+  }
+}
+
+function recordSignalEvent(details) {
+  signalEvents.push({ at: Date.now(), ...details });
+  if (signalEvents.length > MAX_SIGNAL_EVENTS) {
+    signalEvents.shift();
   }
 }
 
@@ -115,7 +124,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "sancil-chat-relay",
       version: RELAY_VERSION,
-      features: ["admin_clients", "admin_blocks", "admin_unblock", "signal_logs", "flush_logs", "socket_dedupe"]
+      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe"]
     });
     return;
   }
@@ -279,6 +288,37 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       message: "Unblock signal sent to both users",
       sentTo
+    });
+    return;
+  }
+
+  // Owner-only history of relationship/call signals, without chat message text.
+  if (url.pathname === "/admin/signals") {
+    if (req.method !== "GET") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!ADMIN_TOKEN) {
+      sendJson(res, 503, { ok: false, error: "ADMIN_TOKEN is not configured" });
+      return;
+    }
+    if (!isAdminAuthorized(req)) {
+      sendJson(res, 401, { ok: false, error: "Unauthorized" });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      generatedAt: nowIso(Date.now()),
+      note: "Recent non-chat signals since server restart; chat text is never stored.",
+      signals: signalEvents.slice().reverse().map((event) => ({
+        at: nowIso(event.at),
+        type: event.type,
+        from: event.from,
+        to: event.to,
+        delivered: event.delivered,
+        queued: event.queued
+      }))
     });
     return;
   }
@@ -454,13 +494,15 @@ wss.on("connection", (ws) => {
 
     // Log relationship/call/admin-relevant signals, not normal chat text.
     if (type !== "chat") {
-      log("relayed_signal", {
+      const signalDetails = {
         from: userId,
         to: toId,
         type,
         delivered,
         queued: !delivered
-      });
+      };
+      recordSignalEvent(signalDetails);
+      log("relayed_signal", signalDetails);
     }
   });
 
