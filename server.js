@@ -85,8 +85,20 @@ const server = http.createServer((req, res) => {
     connectedUsers.sort((a, b) => a.userId.localeCompare(b.userId));
 
     let queuedMessages = 0;
-    for (const queue of pendingQueue.values()) {
+    const queueDetails = [];
+    for (const [recipientId, queue] of pendingQueue.entries()) {
       queuedMessages += queue.length;
+      queueDetails.push({
+        recipientId,
+        count: queue.length,
+        types: queue.slice(0, 10).map((raw) => {
+          try {
+            return JSON.parse(raw).type || "chat";
+          } catch (_) {
+            return "invalid";
+          }
+        })
+      });
     }
 
     sendJson(res, 200, {
@@ -96,7 +108,8 @@ const server = http.createServer((req, res) => {
       connectedUsers,
       pendingQueue: {
         users: pendingQueue.size,
-        messages: queuedMessages
+        messages: queuedMessages,
+        details: queueDetails
       }
     });
     return;
@@ -174,6 +187,8 @@ function deliverOrQueue(toId, rawPayload) {
       queue.shift();
     }
   }
+
+  return delivered;
 }
 
 function flushPending(userId, ws) {
@@ -216,8 +231,12 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    const type = typeof payload.type === "string" ? payload.type : "chat";
     const toId = typeof payload.to === "string" ? payload.to.trim() : "";
-    if (!toId) return;
+    if (!toId) {
+      log("dropped_no_to", { from: userId, type });
+      return;
+    }
 
     // Ensure sender ID matches authenticated connection
     payload.from = userId;
@@ -225,7 +244,18 @@ wss.on("connection", (ws) => {
       payload.timestamp = Date.now();
     }
 
-    deliverOrQueue(toId, JSON.stringify(payload));
+    const delivered = deliverOrQueue(toId, JSON.stringify(payload));
+
+    // Log relationship/call/admin-relevant signals, not normal chat text.
+    if (type !== "chat") {
+      log("relayed_signal", {
+        from: userId,
+        to: toId,
+        type,
+        delivered,
+        queued: !delivered
+      });
+    }
   });
 
   ws.on("close", (code, reason) => {
