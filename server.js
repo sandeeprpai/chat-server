@@ -2,18 +2,106 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
+// Set this in Render before using /admin/clients.
+// Example: ADMIN_TOKEN=change-me-to-a-long-random-value
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
 // In-memory maps only (zero database, zero disk storage)
 const clients = new Map();       // userId -> Set<WebSocket>
 const pendingQueue = new Map();  // recipientId -> Array<JSON string>
 
+function nowIso(ms) {
+  return new Date(ms).toISOString();
+}
+
+function clientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.length > 0) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket.remoteAddress || null;
+}
+
+function log(event, details) {
+  console.log(JSON.stringify({ event, at: nowIso(Date.now()), ...details }));
+}
+
+function isAdminAuthorized(req) {
+  if (!ADMIN_TOKEN) return false;
+  return req.headers.authorization === `Bearer ${ADMIN_TOKEN}`;
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body, null, 2));
+}
+
 const server = http.createServer((req, res) => {
-  // Simple HTTP health check endpoint for Render / uptime checks
-  if (req.url === "/" || req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "sancil-chat-relay" }));
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  } catch (_) {
+    res.writeHead(400);
+    res.end("Bad Request");
     return;
   }
+
+  // Simple HTTP health check endpoint for Render / uptime checks
+  if (url.pathname === "/" || url.pathname === "/health") {
+    sendJson(res, 200, { ok: true, service: "sancil-chat-relay" });
+    return;
+  }
+
+  // Owner-only list of currently connected sockets.
+  // This is the closest thing to "connected devices" the relay can know:
+  // one WebSocket normally means one app session/device.
+  if (url.pathname === "/admin/clients") {
+    if (req.method !== "GET") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!ADMIN_TOKEN) {
+      sendJson(res, 503, { ok: false, error: "ADMIN_TOKEN is not configured" });
+      return;
+    }
+    if (!isAdminAuthorized(req)) {
+      sendJson(res, 401, { ok: false, error: "Unauthorized" });
+      return;
+    }
+
+    const connectedUsers = [];
+    for (const [userId, sockets] of clients.entries()) {
+      connectedUsers.push({
+        userId,
+        socketCount: sockets.size,
+        sockets: Array.from(sockets).map((ws) => ({
+          connectedAt: nowIso(ws.connectedAt),
+          lastSeenAt: nowIso(ws.lastSeenAt),
+          ip: ws.ip || null,
+          userAgent: ws.userAgent || null
+        }))
+      });
+    }
+    connectedUsers.sort((a, b) => a.userId.localeCompare(b.userId));
+
+    let queuedMessages = 0;
+    for (const queue of pendingQueue.values()) {
+      queuedMessages += queue.length;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      generatedAt: nowIso(Date.now()),
+      connectedSockets: wss.clients.size,
+      connectedUsers,
+      pendingQueue: {
+        users: pendingQueue.size,
+        messages: queuedMessages
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not Found");
 });
@@ -36,6 +124,12 @@ server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.userId = userId;
     ws.isAlive = true;
+    ws.connectedAt = Date.now();
+    ws.lastSeenAt = ws.connectedAt;
+    ws.ip = clientIp(req);
+    ws.userAgent = typeof req.headers["user-agent"] === "string"
+      ? req.headers["user-agent"]
+      : null;
     wss.emit("connection", ws, req);
   });
 });
@@ -101,11 +195,20 @@ wss.on("connection", (ws) => {
   registerClient(userId, ws);
   flushPending(userId, ws);
 
+  log("connected", {
+    userId,
+    ip: ws.ip,
+    socketCount: clients.get(userId).size
+  });
+
   ws.on("pong", () => {
     ws.isAlive = true;
+    ws.lastSeenAt = Date.now();
   });
 
   ws.on("message", (data) => {
+    ws.lastSeenAt = Date.now();
+
     let payload;
     try {
       payload = JSON.parse(data.toString());
@@ -125,12 +228,22 @@ wss.on("connection", (ws) => {
     deliverOrQueue(toId, JSON.stringify(payload));
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code, reason) => {
     unregisterClient(userId, ws);
+    log("disconnected", {
+      userId,
+      code,
+      reason: String(reason || ""),
+      socketCount: clients.has(userId) ? clients.get(userId).size : 0
+    });
   });
 
-  ws.on("error", () => {
+  ws.on("error", (error) => {
     unregisterClient(userId, ws);
+    log("socket_error", {
+      userId,
+      error: error && error.message ? error.message : String(error)
+    });
   });
 });
 
@@ -139,6 +252,7 @@ const heartbeat = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
       unregisterClient(ws.userId, ws);
+      log("heartbeat_timeout", { userId: ws.userId });
       return ws.terminate();
     }
     ws.isAlive = false;
@@ -151,5 +265,8 @@ wss.on("close", () => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Chat relay listening on port ${PORT}`);
+  console.log(
+    `Chat relay listening on port ${PORT}` +
+    (ADMIN_TOKEN ? " (admin endpoint enabled)" : " (admin endpoint disabled: set ADMIN_TOKEN)")
+  );
 });
