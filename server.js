@@ -3,7 +3,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 4;
+const RELAY_VERSION = 5;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -15,6 +15,9 @@ const blockEvents = [];          // recent relay-observed block/unblock signals
 const signalEvents = [];         // recent non-chat signals, for owner diagnostics
 const MAX_BLOCK_EVENTS = 500;
 const MAX_SIGNAL_EVENTS = 500;
+// Chats are retried by the sender until the recipient confirms delivery. Keep enough
+// distinct messages for a long offline period instead of dropping the oldest at 100.
+const MAX_PENDING_MESSAGES = 500;
 
 function nowIso(ms) {
   return new Date(ms).toISOString();
@@ -124,7 +127,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "sancil-chat-relay",
       version: RELAY_VERSION,
-      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe"]
+      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe"]
     });
     return;
   }
@@ -386,6 +389,11 @@ function unregisterClient(userId, ws) {
   }
 }
 
+function queueKey(payload) {
+  if (!payload || !payload.messageId) return null;
+  return `${payload.from}|${payload.to}|${payload.messageId}`;
+}
+
 function deliverOrQueue(toId, rawPayload) {
   const targets = clients.get(toId);
   let delivered = false;
@@ -399,15 +407,36 @@ function deliverOrQueue(toId, rawPayload) {
     }
   }
 
-  // Temporary RAM buffer only while recipient is offline (capped at 100 per user)
+  // Temporary RAM buffer only while the recipient is offline. A sender retries chats until
+  // it gets an end-to-end delivery receipt, so replace an existing queued copy by messageId
+  // instead of letting retries fill the buffer and push out other conversations.
   if (!delivered) {
     if (!pendingQueue.has(toId)) {
       pendingQueue.set(toId, []);
     }
     const queue = pendingQueue.get(toId);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(rawPayload);
+    } catch (_) {
+      // Keep unparseable payloads as-is; they have no dedupe key.
+    }
+    const key = queueKey(parsed);
+    if (key) {
+      for (let i = queue.length - 1; i >= 0; i--) {
+        try {
+          if (queueKey(JSON.parse(queue[i])) === key) {
+            queue.splice(i, 1);
+            break;
+          }
+        } catch (_) {
+          // Ignore corrupt entries while scanning.
+        }
+      }
+    }
     queue.push(rawPayload);
-    if (queue.length > 100) {
-      queue.shift();
+    if (queue.length > MAX_PENDING_MESSAGES) {
+      queue.splice(0, queue.length - MAX_PENDING_MESSAGES);
     }
   }
 
