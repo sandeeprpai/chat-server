@@ -235,6 +235,10 @@ function s3PresignUrl(method, key, expiresSeconds, contentType, extraParams) {
   const credential = `${STORAGE_ACCESS_KEY_ID}/${dateStamp}/${STORAGE_REGION}/s3/aws4_request`;
   const params = [
     ["X-Amz-Algorithm", "AWS4-HMAC-SHA256"],
+    // AWS SDKs add this to presigned URLs; B2's examples include it too. The client never
+    // sends the header, so only the host is signed, but B2 uses this value as the payload
+    // hash when verifying the signature.
+    ["X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD"],
     ["X-Amz-Credential", credential],
     ["X-Amz-Date", amzDate],
     ["X-Amz-Expires", String(expiresSeconds)],
