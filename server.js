@@ -5,7 +5,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 10;
+const RELAY_VERSION = 11;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -196,8 +196,12 @@ function s3Encode(value) {
 }
 
 function s3CanonicalQuery(params) {
-  const entries = Object.entries(params || {})
-    .map(([name, value]) => [name, String(value == null ? "" : value)]);
+  // Signed URL generation passes an array of [name, value] pairs; header signing passes an
+  // object. Normalizing both shapes here keeps the canonical query identical to the URL query.
+  const source = Array.isArray(params) ? params : Object.entries(params || {});
+  const entries = source
+    .filter((entry) => Array.isArray(entry) && entry.length >= 1)
+    .map((entry) => [String(entry[0]), String(entry[1] == null ? "" : entry[1])]);
   entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   return entries.map(([name, value]) => `${s3Encode(name)}=${s3Encode(value)}`).join("&");
 }
@@ -525,7 +529,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "sancil-chat-relay",
       version: RELAY_VERSION,
-      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2"]
+      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2", "album_presigned_url_fixed"]
     });
     return;
   }
