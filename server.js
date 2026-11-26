@@ -5,7 +5,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 8;
+const RELAY_VERSION = 9;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -49,6 +49,13 @@ const STORAGE_REGION = process.env.B2_REGION || process.env.R2_REGION
   || inferStorageRegion(STORAGE_ENDPOINT);
 const MAX_ALBUM_UPLOAD_BYTES = parseInt(process.env.MAX_ALBUM_UPLOAD_BYTES || "52428800", 10);
 const MAX_ALBUM_MANIFEST_BYTES = 1024 * 1024;
+// Files at least 25 MiB are uploaded as up to 5 parallel parts. S3-compatible storage
+// requires every non-final multipart part to be at least 5 MiB, so smaller files keep the
+// simpler single PUT path.
+const ALBUM_MULTIPART_MAX_PARTS = 5;
+const ALBUM_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024;
+const ALBUM_MULTIPART_THRESHOLD_BYTES =
+  ALBUM_MULTIPART_MAX_PARTS * ALBUM_MULTIPART_MIN_PART_BYTES;
 const CLOUD_CONFIGURED = Boolean(STORAGE_ENDPOINT && STORAGE_ACCESS_KEY_ID
   && STORAGE_SECRET_ACCESS_KEY && STORAGE_BUCKET);
 
@@ -187,6 +194,13 @@ function s3Encode(value) {
     .replace(/[!'()*]/g, (ch) => "%" + ch.charCodeAt(0).toString(16).toUpperCase());
 }
 
+function s3CanonicalQuery(params) {
+  const entries = Object.entries(params || {})
+    .map(([name, value]) => [name, String(value == null ? "" : value)]);
+  entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return entries.map(([name, value]) => `${s3Encode(name)}=${s3Encode(value)}`).join("&");
+}
+
 function s3CanonicalUri(key) {
   const safeKey = String(key || "").replace(/^\/+/, "");
   return "/" + s3Encode(STORAGE_BUCKET) + "/" + safeKey.split("/").map(s3Encode).join("/");
@@ -196,8 +210,9 @@ function s3Host() {
   return new URL(STORAGE_ENDPOINT).host;
 }
 
-function s3Url(key) {
-  return new URL(STORAGE_ENDPOINT + s3CanonicalUri(key));
+function s3Url(key, queryParams) {
+  const query = s3CanonicalQuery(queryParams);
+  return new URL(STORAGE_ENDPOINT + s3CanonicalUri(key) + (query ? "?" + query : ""));
 }
 
 function s3Timestamp() {
@@ -208,7 +223,7 @@ function s3Timestamp() {
   };
 }
 
-function s3PresignUrl(method, key, expiresSeconds, contentType) {
+function s3PresignUrl(method, key, expiresSeconds, contentType, extraParams) {
   const { amzDate, dateStamp } = s3Timestamp();
   const host = s3Host();
   const headers = contentType ? { "content-type": contentType, host } : { host };
@@ -224,10 +239,12 @@ function s3PresignUrl(method, key, expiresSeconds, contentType) {
     ["X-Amz-Expires", String(expiresSeconds)],
     ["X-Amz-SignedHeaders", signedHeaders.join(";")]
   ];
-  params.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-  const canonicalQuery = params
-    .map(([name, value]) => `${s3Encode(name)}=${s3Encode(value)}`)
-    .join("&");
+  if (extraParams) {
+    for (const [name, value] of Object.entries(extraParams)) {
+      params.push([name, value == null ? "" : String(value)]);
+    }
+  }
+  const canonicalQuery = s3CanonicalQuery(params);
   const canonicalRequest = [
     method,
     s3CanonicalUri(key),
@@ -249,7 +266,7 @@ function s3PresignUrl(method, key, expiresSeconds, contentType) {
   return `${STORAGE_ENDPOINT}${s3CanonicalUri(key)}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
-function s3SignedHeaders(method, key, body, contentType) {
+function s3SignedHeaders(method, key, body, contentType, queryParams) {
   const { amzDate, dateStamp } = s3Timestamp();
   const payloadHash = sha256Hex(body || "");
   const headers = {
@@ -265,7 +282,7 @@ function s3SignedHeaders(method, key, body, contentType) {
   const canonicalRequest = [
     method,
     s3CanonicalUri(key),
-    "",
+    s3CanonicalQuery(queryParams),
     canonicalHeaders,
     signedHeaders.join(";"),
     payloadHash
@@ -286,11 +303,11 @@ function s3SignedHeaders(method, key, body, contentType) {
   return headers;
 }
 
-function s3Request(method, key, body, contentType) {
+function s3Request(method, key, body, contentType, queryParams) {
   return new Promise((resolve, reject) => {
-    const url = s3Url(key);
+    const url = s3Url(key, queryParams);
     const payload = body ? Buffer.from(body) : Buffer.alloc(0);
-    const headers = s3SignedHeaders(method, key, payload, contentType);
+    const headers = s3SignedHeaders(method, key, payload, contentType, queryParams);
     headers["content-length"] = String(payload.length);
     const transport = url.protocol === "http:" ? http : https;
     const req = transport.request(url, { method, headers }, (res) => {
@@ -328,6 +345,35 @@ function isValidAlbumKey(scope, key) {
     && !key.includes("..") && key.length <= 512;
 }
 
+function isValidUploadId(uploadId) {
+  return typeof uploadId === "string" && uploadId.length > 0 && uploadId.length <= 1024
+    && !/[\u0000-\u001f\u007f]/.test(uploadId);
+}
+
+function parseUploadId(xml) {
+  const match = String(xml || "").match(
+    /<UploadId>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/UploadId>/i);
+  return match ? match[1].trim() : "";
+}
+
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function buildCompleteUploadXml(parts) {
+  const nodes = parts
+    .map((part) => `<Part><PartNumber>${part.partNumber}</PartNumber>`
+      + `<ETag>${escapeXml(part.etag)}</ETag></Part>`)
+    .join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>`
+    + `<CompleteMultipartUpload>${nodes}</CompleteMultipartUpload>`;
+}
+
 const server = http.createServer(async (req, res) => {
   let url;
   try {
@@ -344,7 +390,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "sancil-chat-relay",
       version: RELAY_VERSION,
-      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped"]
+      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped", "album_multipart_upload"]
     });
     return;
   }
@@ -554,13 +600,15 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       enabled: CLOUD_CONFIGURED,
       provider: storageProviderName(),
-      maxUploadBytes: Number.isFinite(MAX_ALBUM_UPLOAD_BYTES) ? MAX_ALBUM_UPLOAD_BYTES : 52428800
+      maxUploadBytes: Number.isFinite(MAX_ALBUM_UPLOAD_BYTES) ? MAX_ALBUM_UPLOAD_BYTES : 52428800,
+      multipartParts: ALBUM_MULTIPART_MAX_PARTS,
+      multipartThresholdBytes: ALBUM_MULTIPART_THRESHOLD_BYTES
     });
     return;
   }
 
-  // Short-lived signed PUT URL for one album photo/video. The APK uploads the bytes
-  // directly to object storage, so media never passes through the relay process.
+  // Signed upload URLs for one album photo/video. Media bytes go phone -> storage directly;
+  // the relay only signs tiny requests. Large files get up to 5 part URLs for parallel upload.
   if (url.pathname === "/api/album/upload-url") {
     if (req.method !== "POST") {
       sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
@@ -591,11 +639,150 @@ const server = http.createServer(async (req, res) => {
     }
     const timestamp = Date.now();
     const key = `albums/${scope}/${albumId}/${timestamp}-${crypto.randomUUID()}-${safeAlbumName(name)}`;
-    // Sign only the host header: the app then sends no Content-Type, which keeps the
-    // presigned PUT compatible with Backblaze B2 and R2.
-    const uploadUrl = s3PresignUrl("PUT", key, 900);
-    log("album_upload_url", { userId, peerId, scope, albumId, size, key });
-    sendJson(res, 200, { ok: true, key, uploadUrl, mime, expiresIn: 900 });
+
+    if (size < ALBUM_MULTIPART_THRESHOLD_BYTES) {
+      // Sign only the host header: the app then sends no Content-Type, which keeps the
+      // presigned PUT compatible with Backblaze B2 and R2.
+      const uploadUrl = s3PresignUrl("PUT", key, 900);
+      log("album_upload_url", { userId, peerId, scope, albumId, size, key });
+      sendJson(res, 200, { ok: true, key, uploadUrl, multipart: false, mime, expiresIn: 900 });
+      return;
+    }
+
+    try {
+      const created = await s3Request("POST", key, "", "application/octet-stream", { uploads: "" });
+      if (created.status < 200 || created.status >= 300) {
+        sendJson(res, 502, { ok: false, error: `Multipart start failed (${created.status})` });
+        return;
+      }
+      const uploadId = parseUploadId(created.body);
+      if (!uploadId) {
+        sendJson(res, 502, { ok: false, error: "Storage did not return an upload id" });
+        return;
+      }
+      const partSize = Math.max(ALBUM_MULTIPART_MIN_PART_BYTES,
+        Math.ceil(size / ALBUM_MULTIPART_MAX_PARTS));
+      const parts = [];
+      for (let start = 0, partNumber = 1; start < size; start += partSize, partNumber++) {
+        const end = Math.min(start + partSize - 1, size - 1);
+        parts.push({
+          partNumber,
+          start,
+          end,
+          uploadUrl: s3PresignUrl("PUT", key, 900, null, {
+            partNumber: String(partNumber),
+            uploadId
+          })
+        });
+      }
+      log("album_multipart_start", {
+        userId, peerId, scope, albumId, size, key, uploadId, partCount: parts.length
+      });
+      sendJson(res, 200, {
+        ok: true, key, uploadId, multipart: true, partSize, parts, mime, expiresIn: 900
+      });
+    } catch (error) {
+      sendJson(res, 502, { ok: false, error: error.message });
+    }
+    return;
+  }
+
+  // B2/R2 assembles the uploaded parts into the final album object.
+  if (url.pathname === "/api/album/upload-complete") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!CLOUD_CONFIGURED) {
+      sendJson(res, 503, { ok: false, error: "Album cloud storage is not configured on the server" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    const scope = chatAlbumScope(userId, peerId);
+    const key = body.key;
+    const uploadId = body.uploadId;
+    const rawParts = Array.isArray(body.parts) ? body.parts : [];
+    if (!scope || !isValidAlbumKey(scope, key) || !isValidUploadId(uploadId)
+        || rawParts.length < 1 || rawParts.length > ALBUM_MULTIPART_MAX_PARTS) {
+      sendJson(res, 400, { ok: false, error: "Invalid multipart completion request" });
+      return;
+    }
+    const parts = [];
+    for (const raw of rawParts) {
+      const partNumber = Number(raw && raw.partNumber);
+      const etag = typeof (raw && raw.etag) === "string" ? raw.etag.trim() : "";
+      if (!Number.isInteger(partNumber) || partNumber < 1
+          || partNumber > ALBUM_MULTIPART_MAX_PARTS || !etag || etag.length > 256) {
+        sendJson(res, 400, { ok: false, error: "Invalid multipart part" });
+        return;
+      }
+      parts.push({ partNumber, etag });
+    }
+    parts.sort((a, b) => a.partNumber - b.partNumber);
+    if (new Set(parts.map((part) => part.partNumber)).size !== parts.length) {
+      sendJson(res, 400, { ok: false, error: "Duplicate multipart part number" });
+      return;
+    }
+    try {
+      const result = await s3Request("POST", key, buildCompleteUploadXml(parts),
+        "application/xml", { uploadId });
+      if (result.status >= 200 && result.status < 300) {
+        log("album_multipart_complete", { userId, peerId, scope, key, partCount: parts.length });
+        sendJson(res, 200, { ok: true, key });
+      } else {
+        sendJson(res, 502, { ok: false, error: `Storage complete failed (${result.status})` });
+      }
+    } catch (error) {
+      sendJson(res, 502, { ok: false, error: error.message });
+    }
+    return;
+  }
+
+  // Cleanup abandoned multipart uploads so failed transfers do not leave orphaned parts.
+  if (url.pathname === "/api/album/upload-abort") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!CLOUD_CONFIGURED) {
+      sendJson(res, 503, { ok: false, error: "Album cloud storage is not configured on the server" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    const scope = chatAlbumScope(userId, peerId);
+    const key = body.key;
+    const uploadId = body.uploadId;
+    if (!scope || !isValidAlbumKey(scope, key) || !isValidUploadId(uploadId)) {
+      sendJson(res, 400, { ok: false, error: "Invalid multipart abort request" });
+      return;
+    }
+    try {
+      const result = await s3Request("DELETE", key, null, "application/octet-stream", { uploadId });
+      if ((result.status >= 200 && result.status < 300) || result.status === 404) {
+        log("album_multipart_abort", { userId, peerId, scope, key });
+        sendJson(res, 200, { ok: true, key });
+      } else {
+        sendJson(res, 502, { ok: false, error: `Storage abort failed (${result.status})` });
+      }
+    } catch (error) {
+      sendJson(res, 502, { ok: false, error: error.message });
+    }
     return;
   }
 
