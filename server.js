@@ -5,7 +5,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 7;
+const RELAY_VERSION = 8;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -90,6 +90,16 @@ function sendJson(res, status, body) {
 
 function isValidUserId(id) {
   return typeof id === "string" && /^[a-z0-9_]{3,24}$/.test(id.trim().toLowerCase());
+}
+
+// Both devices derive the same folder from the two chat participants. Length prefixes keep
+// pairs unambiguous even when user ids contain underscores.
+function chatAlbumScope(userId, peerId) {
+  const a = String(userId || "").trim().toLowerCase();
+  const b = String(peerId || "").trim().toLowerCase();
+  if (!isValidUserId(a) || !isValidUserId(b)) return "";
+  const pair = [a, b].sort();
+  return `chat_${pair[0].length}_${pair[0]}_${pair[1].length}_${pair[1]}`;
 }
 
 function recordBlockEvent(action, blocker, blocked, source) {
@@ -313,8 +323,8 @@ function isValidAlbumId(id) {
   return typeof id === "string" && /^[A-Za-z0-9_-]{4,80}$/.test(id);
 }
 
-function isValidAlbumKey(userId, key) {
-  return typeof key === "string" && key.startsWith(`albums/${userId}/`)
+function isValidAlbumKey(scope, key) {
+  return typeof key === "string" && key.startsWith(`albums/${scope}/`)
     && !key.includes("..") && key.length <= 512;
 }
 
@@ -334,7 +344,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "sancil-chat-relay",
       version: RELAY_VERSION,
-      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2"]
+      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped"]
     });
     return;
   }
@@ -568,21 +578,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    const scope = chatAlbumScope(userId, peerId);
     const albumId = isValidAlbumId(body.albumId) ? body.albumId : "";
     const mime = typeof body.mime === "string" ? body.mime.toLowerCase() : "";
     const size = Number(body.size);
     const name = typeof body.name === "string" ? body.name : "media";
-    if (!userId || !albumId || !(mime.startsWith("image/") || mime.startsWith("video/"))
+    if (!scope || !albumId || !(mime.startsWith("image/") || mime.startsWith("video/"))
         || !Number.isFinite(size) || size <= 0 || size > MAX_ALBUM_UPLOAD_BYTES) {
       sendJson(res, 400, { ok: false, error: "Invalid album upload request" });
       return;
     }
     const timestamp = Date.now();
-    const key = `albums/${userId}/${albumId}/${timestamp}-${crypto.randomUUID()}-${safeAlbumName(name)}`;
+    const key = `albums/${scope}/${albumId}/${timestamp}-${crypto.randomUUID()}-${safeAlbumName(name)}`;
     // Sign only the host header: the app then sends no Content-Type, which keeps the
     // presigned PUT compatible with Backblaze B2 and R2.
     const uploadUrl = s3PresignUrl("PUT", key, 900);
-    log("album_upload_url", { userId, albumId, size, key });
+    log("album_upload_url", { userId, peerId, scope, albumId, size, key });
     sendJson(res, 200, { ok: true, key, uploadUrl, mime, expiresIn: 900 });
     return;
   }
@@ -605,9 +617,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    const scope = chatAlbumScope(userId, peerId);
     const key = body.key;
-    if (!userId || !isValidAlbumKey(userId, key)) {
-      sendJson(res, 400, { ok: false, error: "Invalid album key" });
+    if (!scope || !isValidAlbumKey(scope, key)) {
+      sendJson(res, 400, { ok: false, error: "Invalid album key for this chat" });
       return;
     }
     sendJson(res, 200, { ok: true, key, downloadUrl: s3PresignUrl("GET", key, 900), expiresIn: 900 });
@@ -616,23 +630,26 @@ const server = http.createServer(async (req, res) => {
 
   // Cloud album manifest: album names + item metadata. Media bytes stay in storage objects.
   if (url.pathname === "/api/album/manifest") {
-    const userId = (url.searchParams.get("userId") || "").trim().toLowerCase();
-    if (!isValidUserId(userId)) {
-      sendJson(res, 400, { ok: false, error: "Invalid userId" });
-      return;
-    }
     if (!CLOUD_CONFIGURED) {
       sendJson(res, 503, { ok: false, error: "Album cloud storage is not configured on the server" });
       return;
     }
-    const key = `albums/${userId}/manifest.json`;
     if (req.method === "GET") {
+      const userId = (url.searchParams.get("userId") || "").trim().toLowerCase();
+      const peerId = (url.searchParams.get("peerId") || "").trim().toLowerCase();
+      const scope = chatAlbumScope(userId, peerId);
+      if (!scope) {
+        sendJson(res, 400, { ok: false, error: "Invalid chat participants" });
+        return;
+      }
+      const key = `albums/${scope}/manifest.json`;
       try {
         const result = await s3Request("GET", key, null, "application/json");
         if (result.status === 404) {
-          sendJson(res, 200, { ok: true, userId, manifest: null });
+          sendJson(res, 200, { ok: true, userId, peerId, scope, manifest: null });
         } else if (result.status >= 200 && result.status < 300) {
-          sendJson(res, 200, { ok: true, userId, manifest: JSON.parse(result.body || "{}") });
+          sendJson(res, 200, { ok: true, userId, peerId, scope,
+            manifest: JSON.parse(result.body || "{}") });
         } else {
           sendJson(res, 502, { ok: false, error: `Storage read failed (${result.status})` });
         }
@@ -649,6 +666,13 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { ok: false, error: error.message });
         return;
       }
+      const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+      const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+      const scope = chatAlbumScope(userId, peerId);
+      if (!scope) {
+        sendJson(res, 400, { ok: false, error: "Invalid chat participants" });
+        return;
+      }
       if (!body.manifest || typeof body.manifest !== "object") {
         sendJson(res, 400, { ok: false, error: "Missing manifest" });
         return;
@@ -658,10 +682,11 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 413, { ok: false, error: "Album manifest is too large" });
         return;
       }
+      const key = `albums/${scope}/manifest.json`;
       try {
         const result = await s3Request("PUT", key, serialized, "application/json");
         if (result.status >= 200 && result.status < 300) {
-          sendJson(res, 200, { ok: true, userId, updatedAt: Date.now() });
+          sendJson(res, 200, { ok: true, userId, peerId, scope, updatedAt: Date.now() });
         } else {
           sendJson(res, 502, { ok: false, error: `Storage write failed (${result.status})` });
         }
@@ -692,9 +717,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    const scope = chatAlbumScope(userId, peerId);
     const key = body.key;
-    if (!userId || !isValidAlbumKey(userId, key)) {
-      sendJson(res, 400, { ok: false, error: "Invalid album key" });
+    if (!scope || !isValidAlbumKey(scope, key)) {
+      sendJson(res, 400, { ok: false, error: "Invalid album key for this chat" });
       return;
     }
     try {
