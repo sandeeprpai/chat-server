@@ -5,7 +5,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 11;
+const RELAY_VERSION = 12;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -374,6 +374,76 @@ function escapeXml(value) {
     .replace(/'/g, "&apos;");
 }
 
+function xmlText(value) {
+  return String(value == null ? "" : value)
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/**
+ * B2 is versioned. A plain S3 DELETE only inserts a hide marker, so the old versions still
+ * appear in the bucket. List every version of this key and delete each version explicitly.
+ */
+function parseObjectVersions(xml, exactKey) {
+  const result = [];
+  const blocks = String(xml || "").match(/<(Version|DeleteMarker)>[\s\S]*?<\/\1>/g) || [];
+  for (const block of blocks) {
+    const keyMatch = block.match(/<Key>([\s\S]*?)<\/Key>/i);
+    const idMatch = block.match(/<VersionId>([\s\S]*?)<\/VersionId>/i);
+    if (!keyMatch || !idMatch) {
+      continue;
+    }
+    const versionId = xmlText(idMatch[1]).trim();
+    if (xmlText(keyMatch[1]).trim() === exactKey && versionId) {
+      result.push({ versionId, deleteMarker: /^<DeleteMarker>/.test(block) });
+    }
+  }
+  return result;
+}
+
+async function deleteStoredObject(key) {
+  let listingOk = false;
+  let versions = [];
+  try {
+    const listed = await s3Request("GET", key, null, "application/octet-stream", {
+      versions: "",
+      prefix: key,
+      "max-keys": "1000"
+    });
+    if (listed.status >= 200 && listed.status < 300) {
+      listingOk = true;
+      versions = parseObjectVersions(listed.body, key);
+    }
+  } catch (_) {
+    // Providers without ListObjectVersions fall back to a plain DELETE below.
+  }
+
+  if (listingOk && versions.length > 0) {
+    for (const version of versions) {
+      const result = await s3Request("DELETE", key, null, "application/octet-stream", {
+        versionId: version.versionId
+      });
+      if (!(result.status >= 200 && result.status < 300) && result.status !== 404) {
+        throw new Error(`Storage version delete failed (${result.status})`);
+      }
+    }
+    return versions.length;
+  }
+  if (listingOk) {
+    return 0;
+  }
+
+  const result = await s3Request("DELETE", key, null, "application/octet-stream");
+  if ((result.status >= 200 && result.status < 300) || result.status === 404) {
+    return 0;
+  }
+  throw new Error(`Storage delete failed (${result.status})`);
+}
+
 function buildCompleteUploadXml(parts) {
   const nodes = parts
     .map((part) => `<Part><PartNumber>${part.partNumber}</PartNumber>`
@@ -529,7 +599,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "sancil-chat-relay",
       version: RELAY_VERSION,
-      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2", "album_presigned_url_fixed"]
+      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2", "album_presigned_url_fixed", "album_delete_all_versions"]
     });
     return;
   }
@@ -1085,12 +1155,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     try {
-      const result = await s3Request("DELETE", key, null, "application/octet-stream");
-      if (result.status >= 200 && result.status < 300 || result.status === 404) {
-        sendJson(res, 200, { ok: true, key });
-      } else {
-        sendJson(res, 502, { ok: false, error: `Storage delete failed (${result.status})` });
-      }
+      const deletedVersions = await deleteStoredObject(key);
+      sendJson(res, 200, { ok: true, key, deletedVersions });
     } catch (error) {
       sendJson(res, 502, { ok: false, error: error.message });
     }
