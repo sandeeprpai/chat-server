@@ -5,7 +5,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 9;
+const RELAY_VERSION = 10;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -47,6 +47,7 @@ function inferStorageRegion(endpoint) {
 
 const STORAGE_REGION = process.env.B2_REGION || process.env.R2_REGION
   || inferStorageRegion(STORAGE_ENDPOINT);
+// Also caps large chat attachments; the app keeps files <= 10 MB on the relay path.
 const MAX_ALBUM_UPLOAD_BYTES = parseInt(process.env.MAX_ALBUM_UPLOAD_BYTES || "52428800", 10);
 const MAX_ALBUM_MANIFEST_BYTES = 1024 * 1024;
 // Files at least 25 MiB are uploaded as up to 5 parallel parts. S3-compatible storage
@@ -374,6 +375,136 @@ function buildCompleteUploadXml(parts) {
     + `<CompleteMultipartUpload>${nodes}</CompleteMultipartUpload>`;
 }
 
+// Albums use `albums/<scope>/...`, large chat attachments use `files/<scope>/...`. Both
+// objects are private and reachable only through short-lived signed URLs from this relay.
+function objectPrefix(kind) {
+  return kind === "chat" ? "files" : "albums";
+}
+
+function isValidScopedObjectKey(scope, key, kind) {
+  return typeof key === "string" && key.startsWith(`${objectPrefix(kind)}/${scope}/`)
+    && !key.includes("..") && key.length <= 512;
+}
+
+function objectEvent(kind, name) {
+  return `${kind === "chat" ? "chat_file" : "album"}_${name}`;
+}
+
+async function respondUploadUrls(res, options) {
+  const { userId, peerId, scope, key, mime, size, kind } = options;
+  if (size < ALBUM_MULTIPART_THRESHOLD_BYTES) {
+    // Sign only the host header: the app sends no Content-Type, which keeps presigned
+    // PUTs compatible with Backblaze B2 and R2.
+    const uploadUrl = s3PresignUrl("PUT", key, 900);
+    log(objectEvent(kind, "upload_url"), { userId, peerId, scope, size, key });
+    sendJson(res, 200, { ok: true, key, uploadUrl, multipart: false, mime, expiresIn: 900 });
+    return;
+  }
+
+  try {
+    const created = await s3Request("POST", key, "", "application/octet-stream", { uploads: "" });
+    if (created.status < 200 || created.status >= 300) {
+      sendJson(res, 502, { ok: false, error: `Multipart start failed (${created.status})` });
+      return;
+    }
+    const uploadId = parseUploadId(created.body);
+    if (!uploadId) {
+      sendJson(res, 502, { ok: false, error: "Storage did not return an upload id" });
+      return;
+    }
+    const partSize = Math.max(ALBUM_MULTIPART_MIN_PART_BYTES,
+      Math.ceil(size / ALBUM_MULTIPART_MAX_PARTS));
+    const parts = [];
+    for (let start = 0, partNumber = 1; start < size; start += partSize, partNumber++) {
+      const end = Math.min(start + partSize - 1, size - 1);
+      parts.push({
+        partNumber,
+        start,
+        end,
+        uploadUrl: s3PresignUrl("PUT", key, 900, null, {
+          partNumber: String(partNumber),
+          uploadId
+        })
+      });
+    }
+    log(objectEvent(kind, "multipart_start"), {
+      userId, peerId, scope, size, key, uploadId, partCount: parts.length
+    });
+    sendJson(res, 200, {
+      ok: true, key, uploadId, multipart: true, partSize, parts, mime, expiresIn: 900
+    });
+  } catch (error) {
+    sendJson(res, 502, { ok: false, error: error.message });
+  }
+}
+
+async function respondCompleteUpload(res, options) {
+  const { userId, peerId, scope, key, uploadId, rawParts, kind } = options;
+  if (!scope || !isValidScopedObjectKey(scope, key, kind) || !isValidUploadId(uploadId)
+      || rawParts.length < 1 || rawParts.length > ALBUM_MULTIPART_MAX_PARTS) {
+    sendJson(res, 400, { ok: false, error: "Invalid multipart completion request" });
+    return;
+  }
+  const parts = [];
+  for (const raw of rawParts) {
+    const partNumber = Number(raw && raw.partNumber);
+    const etag = typeof (raw && raw.etag) === "string" ? raw.etag.trim() : "";
+    if (!Number.isInteger(partNumber) || partNumber < 1
+        || partNumber > ALBUM_MULTIPART_MAX_PARTS || !etag || etag.length > 256) {
+      sendJson(res, 400, { ok: false, error: "Invalid multipart part" });
+      return;
+    }
+    parts.push({ partNumber, etag });
+  }
+  parts.sort((a, b) => a.partNumber - b.partNumber);
+  if (new Set(parts.map((part) => part.partNumber)).size !== parts.length) {
+    sendJson(res, 400, { ok: false, error: "Duplicate multipart part number" });
+    return;
+  }
+  try {
+    const result = await s3Request("POST", key, buildCompleteUploadXml(parts),
+      "application/xml", { uploadId });
+    if (result.status >= 200 && result.status < 300) {
+      log(objectEvent(kind, "multipart_complete"), { userId, peerId, scope, key });
+      sendJson(res, 200, { ok: true, key });
+    } else {
+      sendJson(res, 502, { ok: false, error: `Storage complete failed (${result.status})` });
+    }
+  } catch (error) {
+    sendJson(res, 502, { ok: false, error: error.message });
+  }
+}
+
+async function respondAbortUpload(res, options) {
+  const { userId, peerId, scope, key, uploadId, kind } = options;
+  if (!scope || !isValidScopedObjectKey(scope, key, kind) || !isValidUploadId(uploadId)) {
+    sendJson(res, 400, { ok: false, error: "Invalid multipart abort request" });
+    return;
+  }
+  try {
+    const result = await s3Request("DELETE", key, null, "application/octet-stream", { uploadId });
+    if ((result.status >= 200 && result.status < 300) || result.status === 404) {
+      log(objectEvent(kind, "multipart_abort"), { userId, peerId, scope, key });
+      sendJson(res, 200, { ok: true, key });
+    } else {
+      sendJson(res, 502, { ok: false, error: `Storage abort failed (${result.status})` });
+    }
+  } catch (error) {
+    sendJson(res, 502, { ok: false, error: error.message });
+  }
+}
+
+function respondDownloadUrl(res, options) {
+  const { scope, key, kind } = options;
+  if (!scope || !isValidScopedObjectKey(scope, key, kind)) {
+    sendJson(res, 400, { ok: false, error: "Invalid object key for this chat" });
+    return;
+  }
+  sendJson(res, 200, {
+    ok: true, key, downloadUrl: s3PresignUrl("GET", key, 900), expiresIn: 900
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   let url;
   try {
@@ -390,7 +521,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "sancil-chat-relay",
       version: RELAY_VERSION,
-      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped", "album_multipart_upload"]
+      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2"]
     });
     return;
   }
@@ -639,51 +770,7 @@ const server = http.createServer(async (req, res) => {
     }
     const timestamp = Date.now();
     const key = `albums/${scope}/${albumId}/${timestamp}-${crypto.randomUUID()}-${safeAlbumName(name)}`;
-
-    if (size < ALBUM_MULTIPART_THRESHOLD_BYTES) {
-      // Sign only the host header: the app then sends no Content-Type, which keeps the
-      // presigned PUT compatible with Backblaze B2 and R2.
-      const uploadUrl = s3PresignUrl("PUT", key, 900);
-      log("album_upload_url", { userId, peerId, scope, albumId, size, key });
-      sendJson(res, 200, { ok: true, key, uploadUrl, multipart: false, mime, expiresIn: 900 });
-      return;
-    }
-
-    try {
-      const created = await s3Request("POST", key, "", "application/octet-stream", { uploads: "" });
-      if (created.status < 200 || created.status >= 300) {
-        sendJson(res, 502, { ok: false, error: `Multipart start failed (${created.status})` });
-        return;
-      }
-      const uploadId = parseUploadId(created.body);
-      if (!uploadId) {
-        sendJson(res, 502, { ok: false, error: "Storage did not return an upload id" });
-        return;
-      }
-      const partSize = Math.max(ALBUM_MULTIPART_MIN_PART_BYTES,
-        Math.ceil(size / ALBUM_MULTIPART_MAX_PARTS));
-      const parts = [];
-      for (let start = 0, partNumber = 1; start < size; start += partSize, partNumber++) {
-        const end = Math.min(start + partSize - 1, size - 1);
-        parts.push({
-          partNumber,
-          start,
-          end,
-          uploadUrl: s3PresignUrl("PUT", key, 900, null, {
-            partNumber: String(partNumber),
-            uploadId
-          })
-        });
-      }
-      log("album_multipart_start", {
-        userId, peerId, scope, albumId, size, key, uploadId, partCount: parts.length
-      });
-      sendJson(res, 200, {
-        ok: true, key, uploadId, multipart: true, partSize, parts, mime, expiresIn: 900
-      });
-    } catch (error) {
-      sendJson(res, 502, { ok: false, error: error.message });
-    }
+    await respondUploadUrls(res, { userId, peerId, scope, key, mime, size, kind: "album" });
     return;
   }
 
@@ -707,42 +794,15 @@ const server = http.createServer(async (req, res) => {
     const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
     const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
     const scope = chatAlbumScope(userId, peerId);
-    const key = body.key;
-    const uploadId = body.uploadId;
-    const rawParts = Array.isArray(body.parts) ? body.parts : [];
-    if (!scope || !isValidAlbumKey(scope, key) || !isValidUploadId(uploadId)
-        || rawParts.length < 1 || rawParts.length > ALBUM_MULTIPART_MAX_PARTS) {
-      sendJson(res, 400, { ok: false, error: "Invalid multipart completion request" });
-      return;
-    }
-    const parts = [];
-    for (const raw of rawParts) {
-      const partNumber = Number(raw && raw.partNumber);
-      const etag = typeof (raw && raw.etag) === "string" ? raw.etag.trim() : "";
-      if (!Number.isInteger(partNumber) || partNumber < 1
-          || partNumber > ALBUM_MULTIPART_MAX_PARTS || !etag || etag.length > 256) {
-        sendJson(res, 400, { ok: false, error: "Invalid multipart part" });
-        return;
-      }
-      parts.push({ partNumber, etag });
-    }
-    parts.sort((a, b) => a.partNumber - b.partNumber);
-    if (new Set(parts.map((part) => part.partNumber)).size !== parts.length) {
-      sendJson(res, 400, { ok: false, error: "Duplicate multipart part number" });
-      return;
-    }
-    try {
-      const result = await s3Request("POST", key, buildCompleteUploadXml(parts),
-        "application/xml", { uploadId });
-      if (result.status >= 200 && result.status < 300) {
-        log("album_multipart_complete", { userId, peerId, scope, key, partCount: parts.length });
-        sendJson(res, 200, { ok: true, key });
-      } else {
-        sendJson(res, 502, { ok: false, error: `Storage complete failed (${result.status})` });
-      }
-    } catch (error) {
-      sendJson(res, 502, { ok: false, error: error.message });
-    }
+    await respondCompleteUpload(res, {
+      userId,
+      peerId,
+      scope,
+      key: body.key,
+      uploadId: body.uploadId,
+      rawParts: Array.isArray(body.parts) ? body.parts : [],
+      kind: "album"
+    });
     return;
   }
 
@@ -766,23 +826,14 @@ const server = http.createServer(async (req, res) => {
     const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
     const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
     const scope = chatAlbumScope(userId, peerId);
-    const key = body.key;
-    const uploadId = body.uploadId;
-    if (!scope || !isValidAlbumKey(scope, key) || !isValidUploadId(uploadId)) {
-      sendJson(res, 400, { ok: false, error: "Invalid multipart abort request" });
-      return;
-    }
-    try {
-      const result = await s3Request("DELETE", key, null, "application/octet-stream", { uploadId });
-      if ((result.status >= 200 && result.status < 300) || result.status === 404) {
-        log("album_multipart_abort", { userId, peerId, scope, key });
-        sendJson(res, 200, { ok: true, key });
-      } else {
-        sendJson(res, 502, { ok: false, error: `Storage abort failed (${result.status})` });
-      }
-    } catch (error) {
-      sendJson(res, 502, { ok: false, error: error.message });
-    }
+    await respondAbortUpload(res, {
+      userId,
+      peerId,
+      scope,
+      key: body.key,
+      uploadId: body.uploadId,
+      kind: "album"
+    });
     return;
   }
 
@@ -806,12 +857,126 @@ const server = http.createServer(async (req, res) => {
     const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
     const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
     const scope = chatAlbumScope(userId, peerId);
-    const key = body.key;
-    if (!scope || !isValidAlbumKey(scope, key)) {
-      sendJson(res, 400, { ok: false, error: "Invalid album key for this chat" });
+    respondDownloadUrl(res, { scope, key: body.key, kind: "album" });
+    return;
+  }
+
+  // Large chat attachments use the same private pair scope as albums, but live under files/.
+  // The relay only issues signed URLs; bytes go phone -> B2 -> phone, never through Render.
+  if (url.pathname === "/api/chat-file/upload-url") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
       return;
     }
-    sendJson(res, 200, { ok: true, key, downloadUrl: s3PresignUrl("GET", key, 900), expiresIn: 900 });
+    if (!CLOUD_CONFIGURED) {
+      sendJson(res, 503, { ok: false, error: "Cloud storage is not configured on the server" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    const scope = chatAlbumScope(userId, peerId);
+    const mime = typeof body.mime === "string" && body.mime.length <= 128
+      ? body.mime.toLowerCase() : "application/octet-stream";
+    const size = Number(body.size);
+    const name = typeof body.name === "string" ? body.name : "file";
+    if (!scope || !Number.isFinite(size) || size <= 0 || size > MAX_ALBUM_UPLOAD_BYTES) {
+      sendJson(res, 400, { ok: false, error: "Invalid chat file upload request" });
+      return;
+    }
+    const key = `files/${scope}/${Date.now()}-${crypto.randomUUID()}-${safeAlbumName(name)}`;
+    await respondUploadUrls(res, { userId, peerId, scope, key, mime, size, kind: "chat" });
+    return;
+  }
+
+  if (url.pathname === "/api/chat-file/upload-complete") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!CLOUD_CONFIGURED) {
+      sendJson(res, 503, { ok: false, error: "Cloud storage is not configured on the server" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    await respondCompleteUpload(res, {
+      userId,
+      peerId,
+      scope: chatAlbumScope(userId, peerId),
+      key: body.key,
+      uploadId: body.uploadId,
+      rawParts: Array.isArray(body.parts) ? body.parts : [],
+      kind: "chat"
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/chat-file/upload-abort") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!CLOUD_CONFIGURED) {
+      sendJson(res, 503, { ok: false, error: "Cloud storage is not configured on the server" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    await respondAbortUpload(res, {
+      userId,
+      peerId,
+      scope: chatAlbumScope(userId, peerId),
+      key: body.key,
+      uploadId: body.uploadId,
+      kind: "chat"
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/chat-file/download-url") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!CLOUD_CONFIGURED) {
+      sendJson(res, 503, { ok: false, error: "Cloud storage is not configured on the server" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    respondDownloadUrl(res, {
+      scope: chatAlbumScope(userId, peerId),
+      key: body.key,
+      kind: "chat"
+    });
     return;
   }
 
