@@ -5,7 +5,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 15;
+const RELAY_VERSION = 16;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -794,7 +794,8 @@ function buildHealthFeatures() {
     "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2",
     "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2",
     "album_presigned_url_fixed", "album_delete_all_versions",
-    "presence_authoritative_last_seen", "socket_aware_file_routing"
+    "presence_authoritative_last_seen", "socket_aware_file_routing",
+    "e2ee_opaque_payload"
   ];
   if (fcmMessaging) features.push("fcm_push");
   if (firestoreDb) features.push("firestore_inbox");
@@ -1388,6 +1389,12 @@ const server = http.createServer(async (req, res) => {
       timestamp: Number(body.timestamp) || Date.now(),
       text: typeof body.text === "string" ? body.text.slice(0, 2000) : ""
     };
+    // E2EE chat payloads are already opaque to the relay. Cloud-file metadata is built here,
+    // so copy the encrypted envelope through without trying to read or rewrite its contents.
+    if (body.e2ee === 1 || body.e2ee === "1") {
+      payload.e2ee = 1;
+      if (typeof body.cipher === "string") payload.cipher = body.cipher.slice(0, 8000);
+    }
     try {
       const delivered = deliverOrQueue(peerId, JSON.stringify(payload));
       log("cloud_file_notify", { from: userId, to: peerId, delivered, transferId });
