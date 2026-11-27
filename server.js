@@ -5,7 +5,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 12;
+const RELAY_VERSION = 13;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -98,6 +98,169 @@ function sendJson(res, status, body) {
 
 function isValidUserId(id) {
   return typeof id === "string" && /^[a-z0-9_]{3,24}$/.test(id.trim().toLowerCase());
+}
+
+// Firebase Admin is optional. Missing env vars or the npm package must never stop the relay:
+// the socket path keeps working and /health simply reports FCM as disabled.
+const INBOX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+let firebaseAdmin = null;
+let firestoreDb = null;
+let fcmMessaging = null;
+let firebaseInitError = "not_configured";
+
+try {
+  const adminLib = require("firebase-admin");
+  const projectId = process.env.FIREBASE_PROJECT_ID || "";
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || "";
+  // Render stores literal \n escapes in a single-line env var; Admin needs real newlines.
+  const privateKey = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n").trim();
+  if (projectId && clientEmail && privateKey.includes("PRIVATE KEY") && privateKey.length > 200) {
+    firebaseAdmin = adminLib;
+    if (!firebaseAdmin.apps.length) {
+      firebaseAdmin.initializeApp({
+        credential: firebaseAdmin.credential.cert({ projectId, clientEmail, privateKey })
+      });
+    }
+    firestoreDb = firebaseAdmin.firestore();
+    fcmMessaging = firebaseAdmin.messaging();
+    firebaseInitError = null;
+  } else {
+    firebaseInitError = "missing_or_invalid_env";
+  }
+} catch (error) {
+  firebaseInitError = error && error.message ? error.message : "init_failed";
+}
+
+function inboxDocId(toId, payload) {
+  const seed = [
+    toId,
+    payload.from || "",
+    payload.messageId || "",
+    payload.timestamp || "",
+    typeof payload.text === "string" ? payload.text : ""
+  ].join("|");
+  return crypto.createHash("sha256").update(seed).digest("hex");
+}
+
+function inboxRef(userId) {
+  return firestoreDb.collection("inbox").doc(userId).collection("messages");
+}
+
+async function persistInboxAndNotify(toId, payload) {
+  if (!firestoreDb || toId === "admin") return;
+  const id = inboxDocId(toId, payload);
+  const timestamp = Number(payload.timestamp) || Date.now();
+  const silent = payload.silent === true;
+  await inboxRef(toId).doc(id).set({
+    payload,
+    to: toId,
+    from: payload.from || "",
+    type: payload.type || "chat",
+    messageId: String(payload.messageId || ""),
+    timestamp,
+    silent,
+    // Numeric values keep retries from resetting the 30-day expiry window.
+    createdAt: timestamp,
+    updatedAt: Date.now()
+  }, { merge: true });
+  // Album activity rows are deliberately silent in chat, so they should not ring the phone.
+  // They still wait in the inbox and appear after the app opens.
+  if (!silent) {
+    await sendFcmPush(toId, payload);
+  }
+}
+
+async function sendFcmPush(toId, payload) {
+  if (!fcmMessaging || !firestoreDb) return false;
+  const tokenDoc = await firestoreDb.collection("fcmTokens").doc(toId).get();
+  const token = tokenDoc.exists ? tokenDoc.data().token : "";
+  if (!token) {
+    log("fcm_no_token", { toId });
+    return false;
+  }
+
+  // Deliberately generic. Full message text stays in the relay inbox and is deleted after the
+  // app confirms it stored the message; FCM is only a doorbell.
+  const message = {
+    token,
+    notification: {
+      title: "Sancil Chat",
+      body: "New message"
+    },
+    data: {
+      type: "chat_sync",
+      from: String(payload.from || ""),
+      messageId: String(payload.messageId || ""),
+      timestamp: String(payload.timestamp || "")
+    },
+    android: {
+      priority: "high",
+      notification: {
+        channelId: "sancil_chat_msg_channel",
+        sound: "default"
+      }
+    }
+  };
+
+  try {
+    await fcmMessaging.send(message);
+    log("fcm_sent", { toId, messageId: String(payload.messageId || "") });
+    return true;
+  } catch (error) {
+    const code = error && error.code ? error.code : "";
+    if (code.includes("registration-token-not-registered") || code.includes("invalid-argument")) {
+      await firestoreDb.collection("fcmTokens").doc(toId).delete().catch(() => {});
+    }
+    log("fcm_send_failed", { toId, code });
+    return false;
+  }
+}
+
+async function flushFirestoreInbox(userId, ws) {
+  if (!firestoreDb || ws.readyState !== ws.OPEN) return;
+  try {
+    const snapshot = await inboxRef(userId)
+      .orderBy("timestamp", "asc")
+      .limit(MAX_PENDING_MESSAGES)
+      .get();
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      if (!data || !data.payload) continue;
+      if (ws.readyState !== ws.OPEN) break;
+      ws.send(JSON.stringify(data.payload));
+    }
+    if (snapshot.docs.length > 0) {
+      log("flushed_firestore_inbox", { userId, count: snapshot.docs.length });
+    }
+  } catch (error) {
+    log("firestore_inbox_flush_failed", {
+      userId,
+      error: error && error.message ? error.message : String(error)
+    });
+  }
+}
+
+async function purgeExpiredInbox() {
+  if (!firestoreDb) return;
+  try {
+    const cutoff = Date.now() - INBOX_TTL_MS;
+    const snapshot = await firestoreDb.collectionGroup("messages")
+      .where("createdAt", "<", cutoff)
+      .limit(500)
+      .get();
+    if (snapshot.empty) return;
+    const batch = firestoreDb.batch();
+    snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+    log("purged_expired_inbox", { count: snapshot.size });
+  } catch (error) {
+    log("inbox_purge_failed", { error: error && error.message ? error.message : String(error) });
+  }
+}
+
+if (firestoreDb) {
+  setInterval(() => purgeExpiredInbox().catch(() => {}), 6 * 60 * 60 * 1000);
+  purgeExpiredInbox().catch(() => {});
 }
 
 // Both devices derive the same folder from the two chat participants. Length prefixes keep
@@ -583,6 +746,18 @@ function respondDownloadUrl(res, options) {
   });
 }
 
+function buildHealthFeatures() {
+  const features = [
+    "admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs",
+    "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2",
+    "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2",
+    "album_presigned_url_fixed", "album_delete_all_versions"
+  ];
+  if (fcmMessaging) features.push("fcm_push");
+  if (firestoreDb) features.push("firestore_inbox");
+  return features;
+}
+
 const server = http.createServer(async (req, res) => {
   let url;
   try {
@@ -599,8 +774,123 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "sancil-chat-relay",
       version: RELAY_VERSION,
-      features: ["admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs", "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2", "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2", "album_presigned_url_fixed", "album_delete_all_versions"]
+      features: buildHealthFeatures(),
+      services: {
+        fcm: Boolean(fcmMessaging),
+        firestore: Boolean(firestoreDb)
+      },
+      firebaseInitError: firebaseInitError && firebaseInitError !== "not_configured"
+        ? firebaseInitError
+        : null
     });
+    return;
+  }
+
+  // Registers the device's current FCM token. Tokens are tiny and belong to the relay, not the APK.
+  if (url.pathname === "/api/fcm/token") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 16384);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const token = typeof body.token === "string" ? body.token.trim() : "";
+    if (!userId || !token || token.length > 4096) {
+      sendJson(res, 400, { ok: false, error: "Invalid userId or FCM token" });
+      return;
+    }
+    if (!firestoreDb) {
+      sendJson(res, 200, { ok: true, enabled: false });
+      return;
+    }
+    try {
+      await firestoreDb.collection("fcmTokens").doc(userId).set({
+        token,
+        platform: typeof body.platform === "string" ? body.platform : "android",
+        updatedAt: firebaseAdmin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      sendJson(res, 200, { ok: true, enabled: true });
+    } catch (error) {
+      sendJson(res, 502, { ok: false, error: error.message });
+    }
+    return;
+  }
+
+  // Durable mailbox. The app calls this on open and whenever FCM rings; docs are removed only
+  // after the app confirms it injected them into the local chat database.
+  if (url.pathname === "/api/inbox/sync") {
+    if (req.method !== "GET") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    const userId = url.searchParams.get("userId") || "";
+    if (!isValidUserId(userId)) {
+      sendJson(res, 400, { ok: false, error: "Invalid userId" });
+      return;
+    }
+    if (!firestoreDb) {
+      sendJson(res, 200, { ok: true, enabled: false, messages: [] });
+      return;
+    }
+    try {
+      const snapshot = await inboxRef(userId.trim().toLowerCase())
+        .orderBy("timestamp", "asc")
+        .limit(MAX_PENDING_MESSAGES)
+        .get();
+      const messages = [];
+      for (const doc of snapshot.docs) {
+        const data = doc.data();
+        if (data && data.payload) {
+          messages.push({ id: doc.id, payload: data.payload });
+        }
+      }
+      sendJson(res, 200, { ok: true, enabled: true, messages });
+    } catch (error) {
+      sendJson(res, 502, { ok: false, error: error.message });
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/inbox/ack") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req, 65536);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const ids = Array.isArray(body.messageIds) ? body.messageIds : [];
+    if (!userId || ids.length === 0 || ids.length > 1000) {
+      sendJson(res, 400, { ok: false, error: "Invalid ack request" });
+      return;
+    }
+    if (!firestoreDb) {
+      sendJson(res, 200, { ok: true, enabled: false });
+      return;
+    }
+    try {
+      const ref = inboxRef(userId);
+      const validIds = ids.filter((id) => typeof id === "string" && /^[a-f0-9]{64}$/.test(id));
+      for (let i = 0; i < validIds.length; i += 500) {
+        const batch = firestoreDb.batch();
+        validIds.slice(i, i + 500).forEach((id) => batch.delete(ref.doc(id)));
+        await batch.commit();
+      }
+      sendJson(res, 200, { ok: true, enabled: true, acknowledged: validIds.length });
+    } catch (error) {
+      sendJson(res, 502, { ok: false, error: error.message });
+    }
     return;
   }
 
@@ -1234,6 +1524,12 @@ function queueKey(payload) {
 function deliverOrQueue(toId, rawPayload) {
   const targets = clients.get(toId);
   let delivered = false;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(rawPayload);
+  } catch (_) {
+    // Keep unparseable payloads as-is; they have no dedupe key.
+  }
 
   if (targets && targets.size > 0) {
     for (const sock of targets) {
@@ -1252,12 +1548,6 @@ function deliverOrQueue(toId, rawPayload) {
       pendingQueue.set(toId, []);
     }
     const queue = pendingQueue.get(toId);
-    let parsed = null;
-    try {
-      parsed = JSON.parse(rawPayload);
-    } catch (_) {
-      // Keep unparseable payloads as-is; they have no dedupe key.
-    }
     const key = queueKey(parsed);
     if (key) {
       for (let i = queue.length - 1; i >= 0; i--) {
@@ -1274,6 +1564,17 @@ function deliverOrQueue(toId, rawPayload) {
     queue.push(rawPayload);
     if (queue.length > MAX_PENDING_MESSAGES) {
       queue.splice(0, queue.length - MAX_PENDING_MESSAGES);
+    }
+
+    // Only real chat rows go to the durable inbox. Presence/blocks/calls stay real-time-only so
+    // a reopened app does not replay a stale call or cancel a newer relationship change.
+    if (parsed && parsed.type === "chat") {
+      persistInboxAndNotify(toId, parsed).catch((error) => {
+        log("inbox_write_failed", {
+          toId,
+          error: error && error.message ? error.message : String(error)
+        });
+      });
     }
   }
 
@@ -1312,6 +1613,7 @@ wss.on("connection", (ws) => {
   const userId = ws.userId;
   registerClient(userId, ws);
   flushPending(userId, ws);
+  flushFirestoreInbox(userId, ws);
 
   log("connected", {
     userId,
