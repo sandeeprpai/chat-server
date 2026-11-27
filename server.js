@@ -5,13 +5,14 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 13;
+const RELAY_VERSION = 14;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
 // In-memory maps only (zero database, zero disk storage)
 const clients = new Map();       // userId -> Set<WebSocket>
+const lastSeenAt = new Map();    // userId -> ms, mirrored to Firestore when Firebase is enabled
 const pendingQueue = new Map();  // recipientId -> Array<JSON string>
 const blockEvents = [];          // recent relay-observed block/unblock signals
 const signalEvents = [];         // recent non-chat signals, for owner diagnostics
@@ -261,6 +262,46 @@ async function purgeExpiredInbox() {
 if (firestoreDb) {
   setInterval(() => purgeExpiredInbox().catch(() => {}), 6 * 60 * 60 * 1000);
   purgeExpiredInbox().catch(() => {});
+}
+
+// Presence is server-authoritative so a killed phone cannot leave a stale "last seen now".
+// RAM is the immediate source; Firestore keeps it after a relay restart.
+function recordLastSeen(userId, at = Date.now()) {
+  if (!isValidUserId(userId)) return;
+  const id = userId.trim().toLowerCase();
+  const previous = lastSeenAt.get(id) || 0;
+  const value = Math.max(previous, Number(at) || Date.now());
+  lastSeenAt.set(id, value);
+  if (!firestoreDb) return;
+  firestoreDb.collection("presence").doc(id).set({
+    lastSeenAt: value,
+    updatedAt: Date.now()
+  }, { merge: true }).catch((error) => {
+    log("presence_write_failed", {
+      userId: id,
+      error: error && error.message ? error.message : String(error)
+    });
+  });
+}
+
+async function readLastSeen(userId) {
+  const id = isValidUserId(userId) ? userId.trim().toLowerCase() : "";
+  if (!id) return 0;
+  const local = lastSeenAt.get(id) || 0;
+  if (!firestoreDb) return local;
+  try {
+    const doc = await firestoreDb.collection("presence").doc(id).get();
+    const remote = doc.exists ? Number(doc.data().lastSeenAt) || 0 : 0;
+    const value = Math.max(local, remote);
+    lastSeenAt.set(id, value);
+    return value;
+  } catch (error) {
+    log("presence_read_failed", {
+      userId: id,
+      error: error && error.message ? error.message : String(error)
+    });
+    return local;
+  }
 }
 
 // Both devices derive the same folder from the two chat participants. Length prefixes keep
@@ -751,7 +792,8 @@ function buildHealthFeatures() {
     "admin_clients", "admin_blocks", "admin_unblock", "admin_signals", "signal_logs",
     "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2",
     "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2",
-    "album_presigned_url_fixed", "album_delete_all_versions"
+    "album_presigned_url_fixed", "album_delete_all_versions",
+    "presence_authoritative_last_seen"
   ];
   if (fcmMessaging) features.push("fcm_push");
   if (firestoreDb) features.push("firestore_inbox");
@@ -888,6 +930,27 @@ const server = http.createServer(async (req, res) => {
         await batch.commit();
       }
       sendJson(res, 200, { ok: true, enabled: true, acknowledged: validIds.length });
+    } catch (error) {
+      sendJson(res, 502, { ok: false, error: error.message });
+    }
+    return;
+  }
+
+  // Authoritative last-seen time. The app compares this with any locally stored value and keeps
+  // the newest, so a delayed/offline presence signal can never turn into "last seen now".
+  if (url.pathname === "/api/presence/last-seen") {
+    if (req.method !== "GET") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    const peerId = url.searchParams.get("peerId") || "";
+    if (!isValidUserId(peerId)) {
+      sendJson(res, 400, { ok: false, error: "Invalid userId" });
+      return;
+    }
+    try {
+      const at = await readLastSeen(peerId);
+      sendJson(res, 200, { ok: true, lastSeenAt: at });
     } catch (error) {
       sendJson(res, 502, { ok: false, error: error.message });
     }
@@ -1509,10 +1572,14 @@ function registerClient(userId, ws) {
 
 function unregisterClient(userId, ws) {
   const set = clients.get(userId);
-  if (!set) return;
+  if (!set) {
+    recordLastSeen(userId);
+    return;
+  }
   set.delete(ws);
   if (set.size === 0) {
     clients.delete(userId);
+    recordLastSeen(userId);
   }
 }
 
@@ -1612,6 +1679,7 @@ function flushPending(userId, ws) {
 wss.on("connection", (ws) => {
   const userId = ws.userId;
   registerClient(userId, ws);
+  recordLastSeen(userId);
   flushPending(userId, ws);
   flushFirestoreInbox(userId, ws);
 
