@@ -5,7 +5,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
 // Bump this when deploying so /health confirms which server version Render is running.
-const RELAY_VERSION = 14;
+const RELAY_VERSION = 15;
 // Set this in Render before using /admin/clients.
 // Example: ADMIN_TOKEN=change-me-to-a-long-random-value
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -138,7 +138,8 @@ function inboxDocId(toId, payload) {
     payload.from || "",
     payload.messageId || "",
     payload.timestamp || "",
-    typeof payload.text === "string" ? payload.text : ""
+    typeof payload.text === "string" ? payload.text : "",
+    typeof payload.cloudKey === "string" ? payload.cloudKey : ""
   ].join("|");
   return crypto.createHash("sha256").update(seed).digest("hex");
 }
@@ -793,7 +794,7 @@ function buildHealthFeatures() {
     "flush_logs", "socket_dedupe", "chat_retry_dedupe", "album_cloud_b2",
     "album_chat_scoped", "album_multipart_upload", "chat_file_cloud_b2",
     "album_presigned_url_fixed", "album_delete_all_versions",
-    "presence_authoritative_last_seen"
+    "presence_authoritative_last_seen", "socket_aware_file_routing"
   ];
   if (fcmMessaging) features.push("fcm_push");
   if (firestoreDb) features.push("firestore_inbox");
@@ -954,6 +955,23 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       sendJson(res, 502, { ok: false, error: error.message });
     }
+    return;
+  }
+
+  // Senders ask this before choosing a transfer path. A live socket allows cheap direct chunks;
+  // anything else means B2, because relay RAM and offline chunk queues can disappear on restart.
+  if (url.pathname === "/api/presence/socket") {
+    if (req.method !== "GET") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    const peerId = url.searchParams.get("peerId") || "";
+    if (!isValidUserId(peerId)) {
+      sendJson(res, 400, { ok: false, error: "Invalid userId" });
+      return;
+    }
+    sendJson(res, 200, { ok: true, peerId: peerId.trim().toLowerCase(),
+      connected: isSocketConnected(peerId) });
     return;
   }
 
@@ -1326,6 +1344,60 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Tiny metadata signal for a file already in B2. It goes over HTTP so a sender whose socket
+  // dropped during the upload cannot strand the object; the relay then uses its normal
+  // live-socket / Firestore inbox / FCM path for delivery.
+  if (url.pathname === "/api/chat-file/notify") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
+      return;
+    }
+    if (!CLOUD_CONFIGURED) {
+      sendJson(res, 503, { ok: false, error: "Cloud storage is not configured on the server" });
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+      return;
+    }
+    const userId = isValidUserId(body.userId) ? body.userId.trim().toLowerCase() : "";
+    const peerId = isValidUserId(body.peerId) ? body.peerId.trim().toLowerCase() : "";
+    const transferId = typeof body.transferId === "string" ? body.transferId.trim() : "";
+    const cloudKey = typeof body.cloudKey === "string" ? body.cloudKey.trim() : "";
+    const scope = chatAlbumScope(userId, peerId);
+    const fileSize = Number(body.fileSize);
+    if (!userId || !peerId || !transferId || !scope
+        || !isValidScopedObjectKey(scope, cloudKey, "chat")
+        || !Number.isFinite(fileSize) || fileSize <= 0) {
+      sendJson(res, 400, { ok: false, error: "Invalid chat file metadata" });
+      return;
+    }
+    const payload = {
+      type: "cloud_file",
+      from: userId,
+      to: peerId,
+      messageId: transferId,
+      transferId,
+      cloudKey,
+      fileName: typeof body.fileName === "string" ? body.fileName.slice(0, 255) : "file",
+      fileMime: typeof body.fileMime === "string" ? body.fileMime.slice(0, 128) : "*/*",
+      fileSize,
+      timestamp: Number(body.timestamp) || Date.now(),
+      text: typeof body.text === "string" ? body.text.slice(0, 2000) : ""
+    };
+    try {
+      const delivered = deliverOrQueue(peerId, JSON.stringify(payload));
+      log("cloud_file_notify", { from: userId, to: peerId, delivered, transferId });
+      sendJson(res, 200, { ok: true, delivered });
+    } catch (error) {
+      sendJson(res, 502, { ok: false, error: error.message });
+    }
+    return;
+  }
+
   if (url.pathname === "/api/chat-file/upload-complete") {
     if (req.method !== "POST") {
       sendJson(res, 405, { ok: false, error: "Method Not Allowed" });
@@ -1583,6 +1655,17 @@ function unregisterClient(userId, ws) {
   }
 }
 
+/** Live socket state used by senders to choose relay chunks vs. a durable B2 upload. */
+function isSocketConnected(userId) {
+  if (!isValidUserId(userId)) return false;
+  const set = clients.get(userId.trim().toLowerCase());
+  if (!set || set.size === 0) return false;
+  for (const sock of set) {
+    if (sock.readyState === sock.OPEN) return true;
+  }
+  return false;
+}
+
 function queueKey(payload) {
   if (!payload || !payload.messageId) return null;
   return `${payload.from}|${payload.to}|${payload.messageId}`;
@@ -1633,9 +1716,10 @@ function deliverOrQueue(toId, rawPayload) {
       queue.splice(0, queue.length - MAX_PENDING_MESSAGES);
     }
 
-    // Only real chat rows go to the durable inbox. Presence/blocks/calls stay real-time-only so
-    // a reopened app does not replay a stale call or cancel a newer relationship change.
-    if (parsed && parsed.type === "chat") {
+    // Chat rows and cloud-file metadata go to the durable inbox: text can replay safely, and a
+    // B2 object needs its one small metadata signal to survive a relay sleep/restart. Presence,
+    // blocks and calls stay real-time-only so a reopened app does not replay stale signals.
+    if (parsed && (parsed.type === "chat" || parsed.type === "cloud_file")) {
       persistInboxAndNotify(toId, parsed).catch((error) => {
         log("inbox_write_failed", {
           toId,
